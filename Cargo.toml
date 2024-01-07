@@ -3,6 +3,16 @@ name = "brc"
 version = "0.1.0"
 edition = "2021"
 
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+codegen-units=1
+
+[profile.profile]
+inherits = "release"
+debug = true
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

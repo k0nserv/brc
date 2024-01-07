@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::ops::Range;
 use std::os::fd::AsRawFd;
+use std::thread;
 use std::{fs, ptr};
 
 use anyhow::{anyhow, Result};
@@ -10,39 +13,81 @@ use anyhow::{anyhow, Result};
 // println!("{}", TEMP_LOOKUP[151587073 / 2]);
 
 const EMPTY_NAME: [u8; 100] = [0; 100];
-static mut TABLE: [(Option<[u8; 100]>, Measure); 10_000] = [(None, Measure::ZERO); 10_000];
+const NUM_THREADS: usize = 10; // Machine specific
+static mut TABLE: [[(Option<[u8; 100]>, Measure); 10_000]; 10] =
+    [[(None, Measure::ZERO); 10_000]; 10];
+
+static mut PAGE_SIZE: usize = 0;
 
 fn main() -> Result<()> {
     let file = fs::File::open("measurements.txt")?;
     let (ptr, len) = unsafe { map_file(&file)? };
     let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+    unsafe {
+        use libc::{sysconf, _SC_PAGESIZE};
 
-    let mut all_stations = Vec::with_capacity(500);
-    process(slice, &mut all_stations);
+        PAGE_SIZE = sysconf(_SC_PAGESIZE) as usize;
+    }
 
-    all_stations.sort_by_key(|&(n, _)| n);
+    let splits = find_splits(slice);
+    for s in splits.iter() {
+        debug_assert!(
+            slice[s.start - 1] == b'\n',
+            "Expected newline, got {}",
+            slice[s.start - 1]
+        );
+        debug_assert!(s.end == slice.len() || slice[s.end] == b'\n');
+    }
+
+    let map = thread::scope(|s| {
+        let handles: Vec<_> = splits
+            .into_iter()
+            .enumerate()
+            .map(|(tid, split)| {
+                s.spawn(move || {
+                    let mut all_stations = Vec::with_capacity(500);
+                    process(tid, &slice[split], &mut all_stations);
+
+                    (tid, all_stations)
+                })
+            })
+            .collect();
+
+        let mut map = BTreeMap::new();
+        for h in handles {
+            let (tid, stations) = h.join().expect("Threads to not panic");
+
+            for (station, idx) in stations {
+                let data = unsafe { TABLE[tid][idx].1 };
+                let name = {
+                    let end = station
+                        .iter()
+                        .enumerate()
+                        .find_map(|(i, b)| (b == &0).then_some(i))
+                        .unwrap();
+
+                    // Guaranteed to be ASCII
+                    unsafe { std::str::from_utf8_unchecked(&station[..end]) }
+                };
+                map.entry(name.to_owned())
+                    .and_modify(|m: &mut Measure| m.merge(data))
+                    .or_insert_with(|| data);
+            }
+        }
+
+        map
+    });
 
     let mut stdout = std::io::stdout().lock();
     stdout.write("{".as_bytes())?;
 
-    let len = all_stations.len();
-    for (i, (station, idx)) in all_stations.iter().enumerate() {
-        let data = unsafe { TABLE[*idx].1 };
-        let mean = data.sum / data.count;
-        let name = {
-            let end = station
-                .iter()
-                .enumerate()
-                .find_map(|(i, b)| (b == &0).then_some(i))
-                .unwrap();
-
-            // Guaranteed to be ASCII
-            unsafe { std::str::from_utf8_unchecked(&station[..end]) }
-        };
+    let len = map.len();
+    for (i, (key, data)) in map.iter().enumerate() {
+        let mean = u32_to_f32(data.sum) / u32_to_f32(data.count);
 
         stdout.write_fmt(format_args!(
-            "{}={:.1}/{:.1}/{:1}",
-            name,
+            "{}={:.1}/{:.1}/{:.1}",
+            key,
             temp_to_f32(data.min),
             temp_to_f32(mean as u16),
             temp_to_f32(data.max),
@@ -55,6 +100,25 @@ fn main() -> Result<()> {
     stdout.write("}".as_bytes())?;
 
     Ok(())
+}
+
+fn find_splits(slice: &[u8]) -> [Range<usize>; NUM_THREADS] {
+    let total_len = slice.len();
+    let expected_len = total_len / NUM_THREADS;
+    let mut result = [0; NUM_THREADS].map(|x| x..x);
+
+    let mut current_idx = 0;
+
+    for i in 0..NUM_THREADS {
+        let mut end = (current_idx + expected_len).min(slice.len());
+        while end < total_len && slice[end] != b'\n' {
+            end += 1;
+        }
+        result[i] = current_idx..end;
+        current_idx = end + 1;
+    }
+
+    result
 }
 
 unsafe fn map_file(file: &fs::File) -> Result<(*const u8, usize)> {
@@ -78,7 +142,8 @@ unsafe fn map_file(file: &fs::File) -> Result<(*const u8, usize)> {
     Ok((ptr as *const u8, len))
 }
 
-fn process(slice: &[u8], stations: &mut Vec<([u8; 100], usize)>) {
+fn process(thread_idx: usize, slice: &[u8], stations: &mut Vec<([u8; 100], usize)>) {
+    debug_assert!(slice[0] != b'\n');
     let mut current = slice;
 
     while current.len() > 0 {
@@ -100,10 +165,14 @@ fn process(slice: &[u8], stations: &mut Vec<([u8; 100], usize)>) {
         let parsed_temp = temp_from_bytes(temp);
 
         unsafe {
-            // SAFETY: Only one thread uses TABLE
-            let idx = find_table_idx(&name, &mut TABLE, stations);
-            TABLE[idx].1.update(parsed_temp);
+            // SAFETY: Only one thread uses this part of TABLE
+            let idx = find_table_idx(&name, &mut TABLE[thread_idx], stations);
+            TABLE[thread_idx][idx].1.update(parsed_temp);
         };
+
+        if (line_end + 1) >= current.len() {
+            break;
+        }
 
         current = &current[line_end + 1..];
     }
@@ -203,6 +272,10 @@ fn temp_to_f32(temp: Temp) -> f32 {
     (temp as f32 / 10.0) - 99.9
 }
 
+fn u32_to_f32(temp: u32) -> f32 {
+    (temp as f32 / 10.0) - 99.9
+}
+
 #[derive(Clone, Copy)]
 struct Measure {
     min: u16,
@@ -224,6 +297,13 @@ impl Measure {
         self.max = self.max.max(value);
         self.sum += value as u32;
         self.count += 1;
+    }
+
+    fn merge(&mut self, other: Measure) {
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.sum += other.sum;
+        self.count += other.count;
     }
 }
 
