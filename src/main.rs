@@ -11,6 +11,7 @@ const EMPTY_NAME: [u8; 100] = [0; 100];
 const NUM_THREADS: usize = 10; // Machine specific
 static mut TABLE: [[(Option<[u8; 100]>, Measure); 10_000]; 10] =
     [[(None, Measure::ZERO); 10_000]; 10];
+static mut POPULATED_STATIONS: [(usize, [usize; 10_000]); 10] = [(0, [usize::MAX; 10_000]); 10];
 
 static mut PAGE_SIZE: usize = 0;
 
@@ -40,19 +41,22 @@ fn main() -> Result<()> {
             .enumerate()
             .map(|(tid, split)| {
                 s.spawn(move || {
-                    let mut all_stations = Vec::with_capacity(500);
-                    process(tid, &slice[split], &mut all_stations);
+                    process(tid, &slice[split]);
 
-                    (tid, all_stations)
+                    tid
                 })
             })
             .collect();
 
         let mut map = BTreeMap::new();
         for h in handles {
-            let (tid, stations) = h.join().expect("Threads to not panic");
+            let tid = h.join().expect("Threads to not panic");
+            // SAFETY: No other thread can be accessing this
+            let station_end = unsafe { POPULATED_STATIONS[tid].0 };
 
-            for idx in stations {
+            for idx in 0..station_end {
+                // SAFETY: No other thread can accessing this
+                let idx = unsafe { POPULATED_STATIONS[tid].1[idx] };
                 let (station, data) = unsafe { &TABLE[tid][idx] };
                 let station = station.unwrap();
                 let name = {
@@ -138,7 +142,7 @@ unsafe fn map_file(file: &fs::File) -> Result<(*const u8, usize)> {
     Ok((ptr as *const u8, len))
 }
 
-fn process(thread_idx: usize, slice: &[u8], stations: &mut Vec<usize>) {
+fn process(thread_idx: usize, slice: &[u8]) {
     debug_assert!(slice[0] != b'\n');
     let mut current = slice;
 
@@ -162,7 +166,11 @@ fn process(thread_idx: usize, slice: &[u8], stations: &mut Vec<usize>) {
 
         unsafe {
             // SAFETY: Only one thread uses this part of TABLE
-            let idx = find_table_idx(&name, &mut TABLE[thread_idx], stations);
+            let idx = find_table_idx(
+                &name,
+                &mut TABLE[thread_idx],
+                &mut POPULATED_STATIONS[thread_idx],
+            );
             TABLE[thread_idx][idx].1.update(parsed_temp);
         };
 
@@ -177,7 +185,7 @@ fn process(thread_idx: usize, slice: &[u8], stations: &mut Vec<usize>) {
 fn find_table_idx(
     name: &[u8],
     table: &mut [(Option<[u8; 100]>, Measure)],
-    stations: &mut Vec<usize>,
+    populated_stations: &mut (usize, [usize; 10_000]),
 ) -> usize {
     let key = {
         // Poor man's hash
@@ -202,7 +210,8 @@ fn find_table_idx(
                 }
 
                 candidate.0 = Some(full_key);
-                stations.push(idx);
+                populated_stations.1[populated_stations.0] = idx;
+                populated_stations.0 += 1;
                 break;
             }
 
