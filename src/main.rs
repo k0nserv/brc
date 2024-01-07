@@ -13,17 +13,10 @@ static mut TABLE: [[(Option<[u8; 100]>, Measure); 10_000]; 10] =
     [[(None, Measure::ZERO); 10_000]; 10];
 static mut POPULATED_STATIONS: [(usize, [usize; 10_000]); 10] = [(0, [usize::MAX; 10_000]); 10];
 
-static mut PAGE_SIZE: usize = 0;
-
 fn main() -> Result<()> {
     let file = fs::File::open("measurements.txt")?;
     let (ptr, len) = unsafe { map_file(&file)? };
     let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-    unsafe {
-        use libc::{sysconf, _SC_PAGESIZE};
-
-        PAGE_SIZE = sysconf(_SC_PAGESIZE) as usize;
-    }
 
     let splits = find_splits(slice);
     for s in splits.iter() {
