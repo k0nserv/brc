@@ -7,11 +7,6 @@ use std::{fs, ptr};
 
 use anyhow::{anyhow, Result};
 
-// This adds a bout 1.7 seconds to loading the binary, but only for the first run, subsequent runs
-// are fast
-// const TEMP_LOOKUP: &[u8; 151587074 * 2] = include_bytes!(concat!(env!("OUT_DIR"), "/temp.bin"));
-// println!("{}", TEMP_LOOKUP[151587073 / 2]);
-
 const EMPTY_NAME: [u8; 100] = [0; 100];
 const NUM_THREADS: usize = 10; // Machine specific
 static mut TABLE: [[(Option<[u8; 100]>, Measure); 10_000]; 10] =
@@ -57,8 +52,9 @@ fn main() -> Result<()> {
         for h in handles {
             let (tid, stations) = h.join().expect("Threads to not panic");
 
-            for (station, idx) in stations {
-                let data = unsafe { TABLE[tid][idx].1 };
+            for idx in stations {
+                let (station, data) = unsafe { &TABLE[tid][idx] };
+                let station = station.unwrap();
                 let name = {
                     let end = station
                         .iter()
@@ -70,8 +66,8 @@ fn main() -> Result<()> {
                     unsafe { std::str::from_utf8_unchecked(&station[..end]) }
                 };
                 map.entry(name.to_owned())
-                    .and_modify(|m: &mut Measure| m.merge(data))
-                    .or_insert_with(|| data);
+                    .and_modify(|m: &mut Measure| m.merge(*data))
+                    .or_insert_with(|| *data);
             }
         }
 
@@ -142,7 +138,7 @@ unsafe fn map_file(file: &fs::File) -> Result<(*const u8, usize)> {
     Ok((ptr as *const u8, len))
 }
 
-fn process(thread_idx: usize, slice: &[u8], stations: &mut Vec<([u8; 100], usize)>) {
+fn process(thread_idx: usize, slice: &[u8], stations: &mut Vec<usize>) {
     debug_assert!(slice[0] != b'\n');
     let mut current = slice;
 
@@ -181,7 +177,7 @@ fn process(thread_idx: usize, slice: &[u8], stations: &mut Vec<([u8; 100], usize
 fn find_table_idx(
     name: &[u8],
     table: &mut [(Option<[u8; 100]>, Measure)],
-    stations: &mut Vec<([u8; 100], usize)>,
+    stations: &mut Vec<usize>,
 ) -> usize {
     let key = {
         // Poor man's hash
@@ -206,7 +202,7 @@ fn find_table_idx(
                 }
 
                 candidate.0 = Some(full_key);
-                stations.push((full_key, idx));
+                stations.push(idx);
                 break;
             }
 
