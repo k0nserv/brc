@@ -79,7 +79,7 @@ fn main() -> Result<()> {
     });
 
     let mut stdout = std::io::stdout().lock();
-    stdout.write("{".as_bytes())?;
+    stdout.write_all("{".as_bytes())?;
 
     let len = map.len();
     for (i, (key, data)) in map.iter().enumerate() {
@@ -94,10 +94,10 @@ fn main() -> Result<()> {
         ))?;
 
         if i < len - 1 {
-            stdout.write(", ".as_bytes())?;
+            stdout.write_all(", ".as_bytes())?;
         }
     }
-    stdout.write("}".as_bytes())?;
+    stdout.write_all("}".as_bytes())?;
 
     Ok(())
 }
@@ -146,7 +146,7 @@ fn process(thread_idx: usize, slice: &[u8]) {
     debug_assert!(slice[0] != b'\n');
     let mut current = slice;
 
-    while current.len() > 0 {
+    while !current.is_empty() {
         let split_idx = current
             .iter()
             .enumerate()
@@ -167,7 +167,7 @@ fn process(thread_idx: usize, slice: &[u8]) {
         unsafe {
             // SAFETY: Only one thread uses this part of TABLE
             let idx = find_table_idx(
-                &name,
+                name,
                 &mut TABLE[thread_idx],
                 &mut POPULATED_STATIONS[thread_idx],
             );
