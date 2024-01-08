@@ -2,5 +2,5 @@
 
 for i in {1..5}
 do
-    time $1
+    time $1 > /dev/null
 done
