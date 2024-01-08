@@ -3,94 +3,106 @@ use std::io::Write;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::thread;
+use std::time::Instant;
 use std::{fs, ptr};
 
 use anyhow::{anyhow, Result};
 
-const EMPTY_NAME: [u8; 100] = [0; 100];
+const MAX_NAME_LEN: usize = 100;
+const EMPTY_NAME: [u8; 100] = [0; MAX_NAME_LEN];
 const NUM_THREADS: usize = 10; // Machine specific
-static mut TABLE: [[(Option<[u8; 100]>, Measure); 10_000]; 10] =
-    [[(None, Measure::ZERO); 10_000]; 10];
-static mut POPULATED_STATIONS: [(usize, [usize; 10_000]); 10] = [(0, [usize::MAX; 10_000]); 10];
+const MAX_NAMES: usize = 10_000;
+const TABLE_SIZE: usize = MAX_NAMES;
+
+static mut TABLE: [[(Option<[u8; MAX_NAME_LEN]>, Measure); TABLE_SIZE]; NUM_THREADS] =
+    [[(None, Measure::ZERO); TABLE_SIZE]; NUM_THREADS];
+static mut POPULATED_STATIONS: [(usize, [usize; MAX_NAMES]); NUM_THREADS] =
+    [(0, [0; MAX_NAMES]); NUM_THREADS];
 
 fn main() -> Result<()> {
-    let file = fs::File::open("measurements.txt")?;
-    let (ptr, len) = unsafe { map_file(&file)? };
-    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let (slice, splits) = {
+        let _timing = Timing::new("Map file step");
 
-    let splits = find_splits(slice);
-    for s in splits.iter() {
-        debug_assert!(
-            slice[s.start - 1] == b'\n',
-            "Expected newline, got {}",
-            slice[s.start - 1]
-        );
-        debug_assert!(s.end == slice.len() || slice[s.end] == b'\n');
-    }
+        let file = fs::File::open("measurements.txt")?;
+        let (ptr, len) = unsafe { map_file(&file)? };
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
 
-    let map = thread::scope(|s| {
-        let handles: Vec<_> = splits
-            .into_iter()
-            .enumerate()
-            .map(|(tid, split)| {
-                s.spawn(move || {
-                    process(tid, &slice[split]);
+        let splits = find_splits(slice);
 
-                    tid
+        (slice, splits)
+    };
+
+    let map = {
+        let _timing = Timing::new("Map step");
+
+        thread::scope(|s| {
+            let handles: Vec<_> = splits
+                .into_iter()
+                .enumerate()
+                .map(|(tid, split)| {
+                    s.spawn(move || {
+                        process(tid, &slice[split]);
+
+                        tid
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        let mut map = BTreeMap::new();
-        for h in handles {
-            let tid = h.join().expect("Threads to not panic");
-            // SAFETY: No other thread can be accessing this
-            let station_end = unsafe { POPULATED_STATIONS[tid].0 };
+            let mut map = BTreeMap::new();
+            for h in handles {
+                let tid = h.join().expect("Threads to not panic");
+                // SAFETY: No other thread can be accessing this
+                let station_end = unsafe { POPULATED_STATIONS[tid].0 };
 
-            for idx in 0..station_end {
-                // SAFETY: No other thread can accessing this
-                let idx = unsafe { POPULATED_STATIONS[tid].1[idx] };
-                let (station, data) = unsafe { &TABLE[tid][idx] };
-                let station = station.unwrap();
-                let name = {
-                    let end = station
-                        .iter()
-                        .enumerate()
-                        .find_map(|(i, b)| (b == &0).then_some(i))
-                        .unwrap();
+                for idx in 0..station_end {
+                    // SAFETY: No other thread can accessing this
+                    let idx = unsafe { POPULATED_STATIONS[tid].1[idx] };
+                    let (station, data) = unsafe { &TABLE[tid][idx] };
+                    let station = station.unwrap();
+                    let name = {
+                        let end = station
+                            .iter()
+                            .enumerate()
+                            .find_map(|(i, b)| (b == &0).then_some(i))
+                            .unwrap();
 
-                    // Guaranteed to be ASCII
-                    unsafe { std::str::from_utf8_unchecked(&station[..end]) }
-                };
-                map.entry(name.to_owned())
-                    .and_modify(|m: &mut Measure| m.merge(*data))
-                    .or_insert_with(|| *data);
+                        // Guaranteed to be ASCII
+                        unsafe { std::str::from_utf8_unchecked(&station[..end]) }
+                    };
+                    map.entry(name.to_owned())
+                        .and_modify(|m: &mut Measure| m.merge(*data))
+                        .or_insert_with(|| *data);
+                }
+            }
+
+            map
+        })
+    };
+
+    {
+        let _timing = Timing::new("Reduce step");
+
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all("{".as_bytes())?;
+
+        let len = map.len();
+        for (i, (key, data)) in map.iter().enumerate() {
+            let mean = u32_to_f32(data.sum) / u32_to_f32(data.count);
+
+            stdout.write_fmt(format_args!(
+                "{}={:.1}/{:.1}/{:.1}",
+                key,
+                temp_to_f32(data.min),
+                temp_to_f32(mean as u16),
+                temp_to_f32(data.max),
+            ))?;
+
+            if i < len - 1 {
+                stdout.write_all(", ".as_bytes())?;
             }
         }
-
-        map
-    });
-
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all("{".as_bytes())?;
-
-    let len = map.len();
-    for (i, (key, data)) in map.iter().enumerate() {
-        let mean = u32_to_f32(data.sum) / u32_to_f32(data.count);
-
-        stdout.write_fmt(format_args!(
-            "{}={:.1}/{:.1}/{:.1}",
-            key,
-            temp_to_f32(data.min),
-            temp_to_f32(mean as u16),
-            temp_to_f32(data.max),
-        ))?;
-
-        if i < len - 1 {
-            stdout.write_all(", ".as_bytes())?;
-        }
+        stdout.write_all("}".as_bytes())?;
     }
-    stdout.write_all("}".as_bytes())?;
 
     Ok(())
 }
@@ -122,7 +134,7 @@ unsafe fn map_file(file: &fs::File) -> Result<(*const u8, usize)> {
         ptr::null_mut::<libc::c_void>(),
         len,
         libc::PROT_READ,
-        libc::MAP_PRIVATE,
+        libc::MAP_SHARED,
         file.as_raw_fd(),
         0,
     );
@@ -140,21 +152,11 @@ fn process(thread_idx: usize, slice: &[u8]) {
     let mut current = slice;
 
     while !current.is_empty() {
-        let split_idx = current
-            .iter()
-            .enumerate()
-            .find(|(_, b)| b == &&b';')
-            .map(|(i, _)| i)
-            .unwrap();
-        let line_end = current
-            .iter()
-            .enumerate()
-            .find(|(_, b)| b == &&b'\n')
-            .map(|(i, _)| i)
-            .unwrap_or_else(|| current.len());
-
+        let split_idx = find_split_idx(current, b';');
         let name = &current[..split_idx];
-        let temp = &current[split_idx + 1..line_end];
+        current = &current[split_idx + 1..];
+        let line_end = find_split_idx(current, b'\n');
+        let temp = &current[..line_end];
         let parsed_temp = temp_from_bytes(temp);
 
         unsafe {
@@ -175,20 +177,46 @@ fn process(thread_idx: usize, slice: &[u8]) {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+fn find_split_idx(data: &[u8], needle: u8) -> usize {
+    use std::arch::aarch64::*;
+
+    let simd_width = 16; // ARM NEON supports 128-bit wide vectors (16 bytes)
+
+    // Iterate over the data with SIMD width
+    for i in (0..data.len()).step_by(simd_width) {
+        let end_index = (i + simd_width).min(data.len());
+
+        // Load data into a 128-bit wide SIMD vector
+        let chunk = unsafe { vld1q_u8(data[i..end_index].as_ptr()) };
+
+        // Compare the SIMD vector with the semicolon
+        let cmp_result = unsafe { vceqq_u8(chunk, vdupq_n_u8(needle)) };
+        let nibble_mask = unsafe { vshrn_n_u16(vreinterpretq_u16_u8(cmp_result), 4) };
+
+        let m = unsafe { vget_lane_u64(vreinterpret_u64_u8(nibble_mask), 0) };
+        if m != 0 {
+            return i + (m.trailing_zeros() as usize >> 2) as usize;
+        }
+    }
+
+    unreachable!()
+
+    //     current
+    //         .iter()
+    //         .enumerate()
+    //         .find(|(_, b)| b == &&b';')
+    //         .map(|(i, _)| i)
+    //         .unwrap()
+}
+
+#[inline(always)]
 fn find_table_idx(
     name: &[u8],
     table: &mut [(Option<[u8; 100]>, Measure)],
-    populated_stations: &mut (usize, [usize; 10_000]),
+    populated_stations: &mut (usize, [usize; MAX_NAMES]),
 ) -> usize {
-    let key = {
-        // Poor man's hash
-        let mut key = [0; 8];
-        for (i, b) in name.iter().take(8).enumerate() {
-            key[8 - i - 1] = *b;
-        }
-
-        usize::from_be_bytes(key)
-    };
+    let key = to_key(name) as usize;
 
     let mut idx = key % table.len();
 
@@ -198,9 +226,10 @@ fn find_table_idx(
             None => {
                 // unoccupied
                 let mut full_key = EMPTY_NAME;
-                for (i, b) in name.iter().enumerate() {
-                    full_key[i] = *b;
-                }
+                // for (i, b) in name.iter().enumerate() {
+                //     full_key[i] = *b;
+                // }
+                full_key[0..name.len()].copy_from_slice(name);
 
                 candidate.0 = Some(full_key);
                 populated_stations.1[populated_stations.0] = idx;
@@ -221,6 +250,22 @@ fn find_table_idx(
     idx
 }
 
+#[inline(always)]
+fn to_key(name: &[u8]) -> u32 {
+    if name.len() > 4 {
+        // Spicy fast path
+        return unsafe { std::mem::transmute::<[u8; 4], _>(name[0..4].try_into().unwrap()) };
+    }
+
+    // Poor man's hash
+    let mut key = [0; 4];
+    for (i, b) in name.iter().take(4).enumerate() {
+        key[4 - i - 1] = *b;
+    }
+
+    u32::from_be_bytes(key)
+}
+
 // -99.9 through 99.9 always with one fractional digit, stored as a u16 in 0.1 increments.
 // 0     =  -99.9
 // 1     =  -99.8
@@ -230,37 +275,32 @@ fn find_table_idx(
 // 1998  = 99.9
 type Temp = u16;
 
+#[inline(always)]
 fn temp_from_bytes(bytes: &[u8]) -> Temp {
-    match bytes.len() {
-        3 => {
-            // y.f
-            let f = (bytes[2] - b'0') as u16;
-            let y = (bytes[0] - b'0') as u16;
+    let f = (bytes[bytes.len() - 1] - b'0') as u16;
+    let y = (bytes[bytes.len() - 3] - b'0') as u16;
 
-            999 + y * 10 + f
-        }
+    match bytes.len() {
         4 if bytes[0] == b'-' => {
             // -y.f
-            let f = (bytes[3] - b'0') as u16;
-            let y = (bytes[1] - b'0') as u16;
-
             999 - (y * 10 + f)
         }
         4 => {
             // xy.f
-            let f = (bytes[3] - b'0') as u16;
-            let y = (bytes[1] - b'0') as u16;
             let x = (bytes[0] - b'0') as u16;
 
             999 + (x * 100 + y * 10 + f)
         }
         5 => {
             // -xy.f
-            let f = (bytes[4] - b'0') as u16;
-            let y = (bytes[2] - b'0') as u16;
             let x = (bytes[1] - b'0') as u16;
 
             999 - (x * 100 + y * 10 + f)
+        }
+        3 => {
+            // y.f
+
+            999 + y * 10 + f
         }
         _ => unreachable!(),
     }
@@ -302,6 +342,28 @@ impl Measure {
         self.max = self.max.max(other.max);
         self.sum += other.sum;
         self.count += other.count;
+    }
+}
+
+struct Timing {
+    name: &'static str,
+    start: Instant,
+}
+
+impl Timing {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for Timing {
+    fn drop(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.start);
+        eprintln!("{} took: {:?}", self.name, elapsed);
     }
 }
 
